@@ -2,9 +2,11 @@
  * POST /api/generate
  *
  * Multipart form:
- *   - voiceId:   string (ElevenLabs voice ID)
- *   - modelId:   string (e.g. "eleven_multilingual_v2")
- *   - skipLlm:   "true" | "false" (optional — skip LLM rewrite for faster/cheaper runs)
+ *   - provider:  "elevenlabs" | "openai"  (default: "openai")
+ *   - voiceId:   string
+ *   - modelId:   string (provider-specific)
+ *   - llmMode:   "narration" | "condensed"  (default: "narration")
+ *   - skipLlm:   "true" | "false" (optional — skip LLM rewrite entirely)
  *   - kind:      "text" | "pdf"
  *   - text:      string (when kind=text)
  *   - file:      File (when kind=pdf)
@@ -15,24 +17,43 @@
 import { NextRequest, NextResponse } from "next/server";
 import { cleanText } from "@/lib/clean";
 import { chunkText } from "@/lib/chunk";
-import { rewriteChunks } from "@/lib/llm";
+import { rewriteChunks, type RewriteMode } from "@/lib/llm";
 import { generateFullAudio } from "@/lib/tts";
+import { generateOpenAiFullAudio } from "@/lib/tts-openai";
 import { extractPdfText } from "@/lib/pdf";
 
 export const runtime = "nodejs";
-// Long documents + TTS calls can take a while; bump the default 10s timeout.
 export const maxDuration = 300;
 
 export async function POST(req: NextRequest) {
   try {
     const form = await req.formData();
+    const provider = String(form.get("provider") || "openai") as
+      | "elevenlabs"
+      | "openai";
     const voiceId = String(form.get("voiceId") || "");
-    const modelId = String(form.get("modelId") || "eleven_multilingual_v2");
+    const modelId = String(
+      form.get("modelId") ||
+        (provider === "openai" ? "tts-1" : "eleven_flash_v2_5"),
+    );
+    const llmMode = (String(form.get("llmMode") || "narration") as RewriteMode);
     const skipLlm = form.get("skipLlm") === "true";
     const kind = String(form.get("kind") || "text");
 
     if (!voiceId) {
       return NextResponse.json({ error: "voiceId is required" }, { status: 400 });
+    }
+    if (provider !== "elevenlabs" && provider !== "openai") {
+      return NextResponse.json(
+        { error: `Unknown provider: ${provider}` },
+        { status: 400 },
+      );
+    }
+    if (llmMode !== "narration" && llmMode !== "condensed") {
+      return NextResponse.json(
+        { error: `Unknown llmMode: ${llmMode}` },
+        { status: 400 },
+      );
     }
 
     // ---- 1. Extract raw text ----
@@ -49,7 +70,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "No text to read" }, { status: 400 });
     }
 
-    // ---- 2. Regex cleanup (fast pass 1) ----
+    // ---- 2. Regex cleanup ----
     const cleaned = cleanText(raw);
 
     // ---- 3. Chunk into TTS-sized segments ----
@@ -58,18 +79,30 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Cleanup left no text to read" }, { status: 400 });
     }
 
-    // ---- 4. LLM rewrite pass (semantic cleanup + self-recursive refinement) ----
-    const rewritten = skipLlm ? chunks : await rewriteChunks(chunks);
+    // ---- 4. LLM rewrite (narration or condensed) ----
+    const rewritten = skipLlm ? chunks : await rewriteChunks(chunks, llmMode);
 
     // Re-chunk the LLM output in case sentences got restructured
-    const finalChunks = skipLlm ? chunks : chunkText(rewritten.join("\n\n"));
+    const finalChunks = skipLlm
+      ? chunks
+      : chunkText(rewritten.join("\n\n"));
 
-    // ---- 5. Generate audio chunk-by-chunk with voice continuity ----
-    const audio = await generateFullAudio({
-      chunks: finalChunks,
-      voiceId,
-      modelId,
-    });
+    // ---- 5. TTS via the selected provider ----
+    const finalCharCount = finalChunks.reduce((s, c) => s + c.length, 0);
+    let audio: Uint8Array;
+    if (provider === "openai") {
+      audio = await generateOpenAiFullAudio({
+        chunks: finalChunks,
+        voiceId,
+        modelId,
+      });
+    } else {
+      audio = await generateFullAudio({
+        chunks: finalChunks,
+        voiceId,
+        modelId,
+      });
+    }
 
     const filename = `paper-${Date.now()}.mp3`;
     return new Response(audio as BodyInit, {
@@ -79,7 +112,10 @@ export async function POST(req: NextRequest) {
         "Content-Disposition": `attachment; filename="${filename}"`,
         "Content-Length": String(audio.byteLength),
         "X-Chunks": String(finalChunks.length),
-        "X-Char-Count": String(cleaned.length),
+        "X-Char-Count": String(finalCharCount),
+        "X-Raw-Char-Count": String(cleaned.length),
+        "X-Provider": provider,
+        "X-Llm-Mode": llmMode,
       },
     });
   } catch (err) {

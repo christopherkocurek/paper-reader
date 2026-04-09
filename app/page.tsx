@@ -9,25 +9,65 @@
 
 import { useEffect, useState, useRef, type ReactNode } from "react";
 
-type Voice = {
+type ElVoice = {
   voice_id: string;
   name: string;
   category?: string;
   labels?: Record<string, string>;
   preview_url?: string;
+  is_owner: boolean;
+};
+
+type OpenAiVoice = {
+  id: string;
+  name: string;
+  description: string;
+  narrationRecommended: boolean;
+};
+
+type OpenAiModel = {
+  id: string;
+  label: string;
+  costPer1M: number;
 };
 
 type Mode = "paste" | "txt" | "pdf";
+type Provider = "elevenlabs" | "openai";
+type LlmMode = "narration" | "condensed";
 
-const MODELS = [
-  { id: "eleven_multilingual_v2", label: "eleven_multilingual_v2  ::  max fidelity" },
-  { id: "eleven_turbo_v2_5", label: "eleven_turbo_v2_5  ::  low latency" },
-  { id: "eleven_v3", label: "eleven_v3  ::  experimental" },
+const ELEVENLABS_MODELS = [
+  {
+    id: "eleven_flash_v2_5",
+    label: "eleven_flash_v2_5  ::  0.5x credit cost ⚡",
+    creditMultiplier: 0.5,
+  },
+  {
+    id: "eleven_turbo_v2_5",
+    label: "eleven_turbo_v2_5  ::  1.0x credit cost",
+    creditMultiplier: 1.0,
+  },
+  {
+    id: "eleven_multilingual_v2",
+    label: "eleven_multilingual_v2  ::  1.0x credit cost, max fidelity",
+    creditMultiplier: 1.0,
+  },
+  {
+    id: "eleven_v3",
+    label: "eleven_v3  ::  experimental",
+    creditMultiplier: 1.0,
+  },
 ];
 
 const NARRATION_VOICES = new Set([
   "Brian", "Adam", "Rachel", "George", "Daniel", "Antoni", "Sarah", "Charlotte", "Matilda",
 ]);
+
+// LLM compression ratios (used for cost estimation)
+const COMPRESSION = {
+  none: 1.0,
+  narration: 0.65,
+  condensed: 0.30,
+};
 
 // ───── utilities ─────────────────────────────────────────────────────
 
@@ -123,10 +163,16 @@ function StatusBar({
   sessionId,
   state,
   charCount,
+  quotaRemaining,
+  quotaLimit,
+  quotaTier,
 }: {
   sessionId: string;
   state: "idle" | "busy" | "ready" | "err";
   charCount: number;
+  quotaRemaining: number | null;
+  quotaLimit: number | null;
+  quotaTier: string | null;
 }) {
   const [uptime, setUptime] = useState(0);
   useEffect(() => {
@@ -138,6 +184,15 @@ function StatusBar({
     state === "busy" ? "BUSY" : state === "ready" ? "READY" : state === "err" ? "ERROR" : "IDLE";
   const stateClass =
     state === "err" ? "alert" : state === "busy" ? "amber-glow" : state === "ready" ? "phosphor" : "text-[var(--fg-dim)]";
+
+  const quotaClass =
+    quotaRemaining === null
+      ? "text-[var(--fg-mute)]"
+      : quotaRemaining < 2000
+        ? "alert"
+        : quotaRemaining < 8000
+          ? "amber-glow"
+          : "phosphor-soft";
 
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border border-[var(--border-bright)] bg-[var(--bg-panel)] px-3 py-1.5 text-[11px] uppercase tracking-wider">
@@ -154,6 +209,17 @@ function StatusBar({
       <span className="text-[var(--fg-dim)]">
         BUFFER :: <span className="phosphor-soft">{fmtBytes(charCount)}</span>
       </span>
+      {quotaRemaining !== null && quotaLimit !== null && (
+        <span className="text-[var(--fg-dim)]">
+          TTS_QUOTA ::{" "}
+          <span className={quotaClass}>
+            {quotaRemaining.toLocaleString()} / {quotaLimit.toLocaleString()}
+          </span>
+          {quotaTier && (
+            <span className="text-[var(--fg-mute)]"> [{quotaTier}]</span>
+          )}
+        </span>
+      )}
       <span className="ml-auto text-[var(--fg-ghost)]">
         paper_reader/v0.1.0
       </span>
@@ -304,10 +370,34 @@ export default function Home() {
   const [txtFile, setTxtFile] = useState<File | null>(null);
   const [pdfFile, setPdfFile] = useState<File | null>(null);
 
-  const [voices, setVoices] = useState<Voice[]>([]);
+  // Backend provider (cheapest default: OpenAI)
+  const [provider, setProvider] = useState<Provider>("openai");
+  const [llmMode, setLlmMode] = useState<LlmMode>("narration");
+
+  // ElevenLabs voices
+  const [usableVoices, setUsableVoices] = useState<ElVoice[]>([]);
+  const [lockedVoices, setLockedVoices] = useState<ElVoice[]>([]);
+  const [elAvailable, setElAvailable] = useState(true);
+
+  // OpenAI voices + models
+  const [openaiVoices, setOpenaiVoices] = useState<OpenAiVoice[]>([]);
+  const [openaiModels, setOpenaiModels] = useState<OpenAiModel[]>([]);
+  const [openaiAvailable, setOpenaiAvailable] = useState(false);
+
+  // Selected voice + model — resets when provider changes
   const [voiceId, setVoiceId] = useState<string>("");
-  const [modelId, setModelId] = useState<string>("eleven_multilingual_v2");
+  const [modelId, setModelId] = useState<string>("tts-1");
   const [useLlmRewrite, setUseLlmRewrite] = useState(true);
+
+  // Voice preview
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewAudio, setPreviewAudio] = useState<HTMLAudioElement | null>(null);
+
+  // ElevenLabs quota (from /api/quota, populated only for that provider)
+  const [quotaRemaining, setQuotaRemaining] = useState<number | null>(null);
+  const [quotaLimit, setQuotaLimit] = useState<number | null>(null);
+  const [quotaTier, setQuotaTier] = useState<string | null>(null);
+  const [quotaResetUnix, setQuotaResetUnix] = useState<number | null>(null);
 
   const [loading, setLoading] = useState(false);
   const [loadingVoices, setLoadingVoices] = useState(true);
@@ -318,7 +408,25 @@ export default function Home() {
   const [audioFileId] = useState(() => hexId());
   const lastObjectUrlRef = useRef<string | null>(null);
 
-  // Fetch voices on mount
+  // Fetch quota on mount (best-effort — silently skipped if key lacks user_read)
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch("/api/quota");
+        const data = await res.json();
+        if (data.ok) {
+          setQuotaRemaining(data.charRemaining);
+          setQuotaLimit(data.charLimit);
+          setQuotaTier(data.tier);
+          setQuotaResetUnix(data.nextResetUnix);
+        }
+      } catch {
+        /* ignore — quota display is optional */
+      }
+    })();
+  }, []);
+
+  // Fetch voices for both providers on mount
   useEffect(() => {
     (async () => {
       try {
@@ -328,17 +436,28 @@ export default function Home() {
             (await res.json()).error ?? "VOICE_REGISTRY_FETCH_FAILED",
           );
         const data = await res.json();
-        const vs = data.voices as Voice[];
-        vs.sort((a, b) => {
+
+        // ElevenLabs
+        const el = data.elevenlabs ?? { ok: false };
+        setElAvailable(el.ok === true);
+        const usable = (el.usable ?? []) as ElVoice[];
+        const locked = (el.locked ?? []) as ElVoice[];
+        const sortFn = (a: ElVoice, b: ElVoice) => {
           const sA = NARRATION_VOICES.has(a.name.split(" ")[0]) ? 0 : 1;
           const sB = NARRATION_VOICES.has(b.name.split(" ")[0]) ? 0 : 1;
           if (sA !== sB) return sA - sB;
           return a.name.localeCompare(b.name);
-        });
-        setVoices(vs);
-        const brian = vs.find((v) => v.name.startsWith("Brian"));
-        const firstNarr = vs.find((v) => NARRATION_VOICES.has(v.name.split(" ")[0]));
-        setVoiceId((brian ?? firstNarr ?? vs[0])?.voice_id ?? "");
+        };
+        usable.sort(sortFn);
+        locked.sort(sortFn);
+        setUsableVoices(usable);
+        setLockedVoices(locked);
+
+        // OpenAI
+        const oa = data.openai ?? {};
+        setOpenaiVoices(oa.voices ?? []);
+        setOpenaiModels(oa.models ?? []);
+        setOpenaiAvailable(oa.ok === true);
       } catch (e) {
         setError(e instanceof Error ? e.message : "UNKNOWN_ERROR");
       } finally {
@@ -347,8 +466,56 @@ export default function Home() {
     })();
     return () => {
       if (lastObjectUrlRef.current) URL.revokeObjectURL(lastObjectUrlRef.current);
+      if (previewAudio) previewAudio.pause();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // When provider changes, reset voice + model to sensible defaults
+  useEffect(() => {
+    if (loadingVoices) return;
+    if (provider === "openai") {
+      const recommended = openaiVoices.find((v) => v.narrationRecommended);
+      setVoiceId((recommended ?? openaiVoices[0])?.id ?? "");
+      setModelId("tts-1");
+    } else {
+      if (usableVoices.length > 0) {
+        const brian = usableVoices.find((v) => v.name.startsWith("Brian"));
+        const firstNarr = usableVoices.find((v) =>
+          NARRATION_VOICES.has(v.name.split(" ")[0]),
+        );
+        setVoiceId((brian ?? firstNarr ?? usableVoices[0]).voice_id);
+      } else {
+        setVoiceId("");
+      }
+      setModelId("eleven_flash_v2_5");
+    }
+  }, [provider, loadingVoices, openaiVoices, usableVoices]);
+
+  // Preview a voice — generates a short audio sample and plays it
+  async function handlePreview() {
+    if (!voiceId || previewLoading) return;
+    setPreviewLoading(true);
+    if (previewAudio) previewAudio.pause();
+    try {
+      const res = await fetch("/api/voice-preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider, voiceId, modelId }),
+      });
+      if (!res.ok) throw new Error("preview failed");
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.play();
+      setPreviewAudio(audio);
+      audio.addEventListener("ended", () => URL.revokeObjectURL(url));
+    } catch (e) {
+      console.error("preview error", e);
+    } finally {
+      setPreviewLoading(false);
+    }
+  }
 
   async function handleGenerate() {
     setError(null);
@@ -359,8 +526,10 @@ export default function Home() {
 
     try {
       const form = new FormData();
+      form.set("provider", provider);
       form.set("voiceId", voiceId);
       form.set("modelId", modelId);
+      form.set("llmMode", llmMode);
       form.set("skipLlm", useLlmRewrite ? "false" : "true");
 
       if (mode === "pdf") {
@@ -400,7 +569,11 @@ export default function Home() {
       const match = disp.match(/filename="([^"]+)"/);
       if (match) setAudioFilename(match[1]);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "UNKNOWN_ERROR");
+      const msg = e instanceof Error ? e.message : "UNKNOWN_ERROR";
+      setError(msg);
+      // Parse ElevenLabs quota errors so we can show remaining credits in the UI
+      const quotaMatch = msg.match(/You have (\d+) credits remaining/i);
+      if (quotaMatch) setQuotaRemaining(parseInt(quotaMatch[1], 10));
     } finally {
       setLoading(false);
     }
@@ -413,6 +586,34 @@ export default function Home() {
         ? txtFile?.size ?? 0
         : pdfFile?.size ?? 0;
 
+  // Cost estimator for both providers. The pipeline goes:
+  //   raw input → clean → LLM rewrite (narration 0.65x or condensed 0.30x)
+  //   → TTS provider charges per final character.
+  const compressionRatio = !useLlmRewrite
+    ? COMPRESSION.none
+    : llmMode === "condensed"
+      ? COMPRESSION.condensed
+      : COMPRESSION.narration;
+  const estimatedFinalChars = Math.round(bufferChars * compressionRatio);
+
+  // ElevenLabs estimate (credits)
+  const elModel =
+    ELEVENLABS_MODELS.find((m) => m.id === modelId) ?? ELEVENLABS_MODELS[0];
+  const estimatedCredits = Math.round(
+    estimatedFinalChars * elModel.creditMultiplier,
+  );
+
+  // OpenAI estimate (dollars)
+  const openaiModel = openaiModels.find((m) => m.id === modelId) ?? openaiModels[0];
+  const estimatedUsd = openaiModel
+    ? (estimatedFinalChars * openaiModel.costPer1M) / 1_000_000
+    : 0;
+
+  const willExceedQuota =
+    provider === "elevenlabs" &&
+    quotaRemaining !== null &&
+    estimatedCredits > quotaRemaining;
+
   const state: "idle" | "busy" | "ready" | "err" = error
     ? "err"
     : loading
@@ -421,9 +622,18 @@ export default function Home() {
         ? "ready"
         : "idle";
 
+  const noUsableElVoices = !loadingVoices && usableVoices.length === 0;
+  const selectedVoiceLocked =
+    provider === "elevenlabs" &&
+    lockedVoices.some((v) => v.voice_id === voiceId);
+  const blockedByElNoVoices = provider === "elevenlabs" && noUsableElVoices;
+
   const canGenerate =
     !loading &&
     !!voiceId &&
+    !blockedByElNoVoices &&
+    !selectedVoiceLocked &&
+    !willExceedQuota &&
     (mode === "paste"
       ? pasteText.trim().length > 0
       : mode === "txt"
@@ -433,7 +643,14 @@ export default function Home() {
   return (
     <main className="mx-auto w-full max-w-3xl px-4 py-8 sm:px-6">
       {/* ═══ TOP STATUS BAR ═══ */}
-      <StatusBar sessionId={sessionId} state={state} charCount={bufferChars} />
+      <StatusBar
+        sessionId={sessionId}
+        state={state}
+        charCount={bufferChars}
+        quotaRemaining={quotaRemaining}
+        quotaLimit={quotaLimit}
+        quotaTier={quotaTier}
+      />
 
       {/* ═══ HEADER / BANNER ═══ */}
       <header className="mt-6 mb-6">
@@ -487,6 +704,114 @@ export default function Home() {
           {">"} pipeline :: extract → sanitize → llm_rewrite → chunk → elevenlabs → concat
         </p>
       </header>
+
+      {/* ═══ QUOTA BANNER (only relevant when provider=elevenlabs) ═══ */}
+      {quotaRemaining !== null && provider === "elevenlabs" && (
+        <div
+          className={`mb-4 border p-3 text-[11px] ${
+            willExceedQuota
+              ? "border-[var(--alert)]/60"
+              : "border-[var(--border-bright)]"
+          } bg-[var(--bg-panel)]`}
+        >
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 uppercase tracking-wider">
+            <span className={willExceedQuota ? "alert" : "phosphor-soft"}>
+              [QUOTA]
+            </span>
+            <span className="text-[var(--fg-dim)]">
+              remaining ::{" "}
+              <span className={willExceedQuota ? "alert" : "phosphor"}>
+                {quotaRemaining.toLocaleString()}
+              </span>{" "}
+              credits
+            </span>
+            <span className="text-[var(--fg-dim)]">
+              this request ::{" "}
+              <span className={willExceedQuota ? "alert" : "phosphor-soft"}>
+                ≈{estimatedCredits.toLocaleString()}
+              </span>{" "}
+              credits
+            </span>
+            {willExceedQuota && (
+              <span className="alert">
+                :: will exceed by {(estimatedCredits - quotaRemaining).toLocaleString()}
+              </span>
+            )}
+          </div>
+          <div className="mt-2 text-[10px] text-[var(--fg-dim)]">
+            {">"} llm rewrite compresses input ~35% :: flash v2.5 model costs
+            0.5x per char :: combined, you get ~3x more audio per credit vs
+            raw-paste with multilingual v2
+          </div>
+          {quotaResetUnix && (
+            <div className="mt-1 text-[10px] text-[var(--fg-dim)]">
+              {">"} quota resets ::{" "}
+              <span className="phosphor-soft">
+                {new Date(quotaResetUnix * 1000).toLocaleString(undefined, {
+                  dateStyle: "medium",
+                  timeStyle: "short",
+                })}
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ═══ NO USABLE VOICES BANNER (only when provider=elevenlabs) ═══ */}
+      {blockedByElNoVoices && (
+        <div className="mb-4 border border-[var(--amber)]/60 bg-[var(--bg-panel)] p-4 text-[11px] leading-relaxed">
+          <div className="mb-2 flex items-center gap-2">
+            <StatusDot state="busy" />
+            <span className="amber-glow uppercase tracking-[0.2em]">
+              [ ATTN ] :: NO USABLE VOICES ON THIS ACCOUNT
+            </span>
+          </div>
+          <div className="space-y-2 text-[var(--fg-dim)]">
+            <div>
+              {">"} your elevenlabs api key is on the{" "}
+              <span className="amber-glow">free tier</span>. free tier can only
+              use voices you own ({lockedVoices.length}{" "}
+              library voices are visible but{" "}
+              <span className="alert">locked</span> for api usage).
+            </div>
+            <div className="mt-3 space-y-1">
+              <div className="phosphor-soft uppercase tracking-[0.2em] text-[10px]">
+                &gt;&gt; options to unlock:
+              </div>
+              <div>
+                <span className="phosphor">[A]</span> clone a voice (free, 2 min){" "}
+                ::{" "}
+                <a
+                  href="https://elevenlabs.io/app/voice-lab"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="phosphor-soft underline hover:phosphor"
+                >
+                  elevenlabs.io/app/voice-lab
+                </a>
+                {" "}— upload 60s of audio, it becomes yours, works immediately with your current key
+              </div>
+              <div>
+                <span className="phosphor">[B]</span> upgrade to starter ($5/mo){" "}
+                ::{" "}
+                <a
+                  href="https://elevenlabs.io/app/subscription"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="phosphor-soft underline hover:phosphor"
+                >
+                  elevenlabs.io/app/subscription
+                </a>
+                {" "}— unlocks api access to all {lockedVoices.length} library voices immediately
+              </div>
+              <div>
+                <span className="phosphor">[C]</span> ask claude to add openai tts
+                as a second backend (no voice restrictions, ~$15/1M chars)
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ═══ INPUT SOURCE ═══ */}
       <Panel
@@ -583,32 +908,151 @@ export default function Home() {
 
       {/* ═══ CONFIG ═══ */}
       <div className="mt-4">
-        <Panel title="CONFIG" meta={<span>{MODELS.length} models loaded</span>}>
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-            <div>
-              <div className="mb-1 text-[10px] uppercase tracking-wider text-[var(--fg-dim)]">
-                {">>"} voice_registry
-              </div>
-              <select
-                value={voiceId}
-                onChange={(e) => setVoiceId(e.target.value)}
-                disabled={loadingVoices}
-                className="w-full text-[12px]"
+        <Panel
+          title="CONFIG"
+          meta={
+            <span>
+              {provider === "openai"
+                ? `openai :: ${openaiVoices.length} voices`
+                : `elevenlabs :: ${usableVoices.length} usable`}
+            </span>
+          }
+        >
+          {/* ── Backend provider toggle ── */}
+          <div>
+            <div className="mb-1.5 text-[10px] uppercase tracking-wider text-[var(--fg-dim)]">
+              {">>"} tts_backend
+            </div>
+            <div className="flex gap-1 text-[12px] uppercase tracking-wider">
+              <button
+                type="button"
+                onClick={() => setProvider("openai")}
+                disabled={!openaiAvailable}
+                className={`px-4 py-2 transition-colors ${
+                  provider === "openai"
+                    ? "phosphor border border-[var(--phosphor)]/70 bg-[var(--bg)]"
+                    : "border border-[var(--border)] text-[var(--fg-dim)] hover:border-[var(--border-hot)] hover:text-[var(--fg)]"
+                } ${!openaiAvailable ? "cursor-not-allowed opacity-40" : "cursor-pointer"}`}
               >
-                {loadingVoices && <option>{">> loading voices <<"}</option>}
-                {!loadingVoices && voices.length === 0 && (
-                  <option>NO_VOICES_AVAILABLE</option>
+                {provider === "openai" ? ">[ OPENAI ]<" : "[ OPENAI ]"}
+                <span className="ml-2 text-[9px] text-[var(--fg-dim)]">
+                  pay-per-use
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setProvider("elevenlabs")}
+                disabled={!elAvailable}
+                className={`px-4 py-2 transition-colors ${
+                  provider === "elevenlabs"
+                    ? "phosphor border border-[var(--phosphor)]/70 bg-[var(--bg)]"
+                    : "border border-[var(--border)] text-[var(--fg-dim)] hover:border-[var(--border-hot)] hover:text-[var(--fg)]"
+                } ${!elAvailable ? "cursor-not-allowed opacity-40" : "cursor-pointer"}`}
+              >
+                {provider === "elevenlabs" ? ">[ ELEVENLABS ]<" : "[ ELEVENLABS ]"}
+                <span className="ml-2 text-[9px] text-[var(--fg-dim)]">
+                  subscription
+                </span>
+              </button>
+            </div>
+          </div>
+
+          {/* ── Voice + model selectors ── */}
+          <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div>
+              <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-[var(--fg-dim)]">
+                <span>{">>"} voice_registry</span>
+                {provider === "elevenlabs" && (
+                  <span className="phosphor-dim">
+                    {usableVoices.length} usable :: {lockedVoices.length} locked
+                  </span>
                 )}
-                {voices.map((v) => {
-                  const isNarration = NARRATION_VOICES.has(v.name.split(" ")[0]);
-                  return (
-                    <option key={v.voice_id} value={v.voice_id}>
-                      {isNarration ? "★ " : "  "}
-                      {v.name}
-                    </option>
-                  );
-                })}
-              </select>
+                {provider === "openai" && (
+                  <span className="phosphor-dim">
+                    {openaiVoices.length} available
+                  </span>
+                )}
+              </div>
+              <div className="flex gap-1.5">
+                <select
+                  value={voiceId}
+                  onChange={(e) => setVoiceId(e.target.value)}
+                  disabled={loadingVoices}
+                  className="flex-1 text-[12px]"
+                >
+                  {loadingVoices && <option>{">> loading voices <<"}</option>}
+
+                  {/* OpenAI voices */}
+                  {provider === "openai" && openaiVoices.length > 0 && (
+                    <>
+                      <optgroup label="── recommended for narration ──">
+                        {openaiVoices
+                          .filter((v) => v.narrationRecommended)
+                          .map((v) => (
+                            <option key={v.id} value={v.id}>
+                              ★ {v.name} — {v.description}
+                            </option>
+                          ))}
+                      </optgroup>
+                      <optgroup label="── other ──">
+                        {openaiVoices
+                          .filter((v) => !v.narrationRecommended)
+                          .map((v) => (
+                            <option key={v.id} value={v.id}>
+                              {v.name} — {v.description}
+                            </option>
+                          ))}
+                      </optgroup>
+                    </>
+                  )}
+
+                  {/* ElevenLabs voices */}
+                  {provider === "elevenlabs" && !loadingVoices && usableVoices.length === 0 && lockedVoices.length === 0 && (
+                    <option>NO_VOICES_AVAILABLE</option>
+                  )}
+                  {provider === "elevenlabs" && !loadingVoices && usableVoices.length === 0 && lockedVoices.length > 0 && (
+                    <option value="">-- no usable voices --</option>
+                  )}
+                  {provider === "elevenlabs" && usableVoices.length > 0 && (
+                    <optgroup label="── usable ──">
+                      {usableVoices.map((v) => {
+                        const isNarration = NARRATION_VOICES.has(v.name.split(" ")[0]);
+                        return (
+                          <option key={v.voice_id} value={v.voice_id}>
+                            {isNarration ? "★ " : "  "}
+                            {v.name}
+                          </option>
+                        );
+                      })}
+                    </optgroup>
+                  )}
+                  {provider === "elevenlabs" && lockedVoices.length > 0 && (
+                    <optgroup label="── locked (paid plan) ──">
+                      {lockedVoices.map((v) => (
+                        <option key={v.voice_id} value={v.voice_id}>
+                          🔒 {v.name}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                </select>
+                <button
+                  type="button"
+                  onClick={handlePreview}
+                  disabled={!voiceId || previewLoading || loadingVoices}
+                  title="preview this voice"
+                  className={`border border-[var(--border-bright)] bg-[var(--bg)] px-3 text-[11px] uppercase tracking-wider transition-colors hover:border-[var(--phosphor)] hover:phosphor ${
+                    previewLoading ? "phosphor blink" : "text-[var(--fg-dim)]"
+                  } ${!voiceId || loadingVoices ? "cursor-not-allowed opacity-40" : "cursor-pointer"}`}
+                >
+                  {previewLoading ? "[ ... ]" : "[ ▶ preview ]"}
+                </button>
+              </div>
+              {selectedVoiceLocked && (
+                <div className="mt-1.5 text-[10px] alert">
+                  [!] this voice requires a paid plan — pick a usable voice
+                </div>
+              )}
             </div>
 
             <div>
@@ -620,33 +1064,138 @@ export default function Home() {
                 onChange={(e) => setModelId(e.target.value)}
                 className="w-full text-[12px]"
               >
-                {MODELS.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.label}
-                  </option>
-                ))}
+                {provider === "openai" &&
+                  openaiModels.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label}
+                    </option>
+                  ))}
+                {provider === "elevenlabs" &&
+                  ELEVENLABS_MODELS.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label}
+                    </option>
+                  ))}
               </select>
             </div>
           </div>
 
-          {/* LLM rewrite toggle */}
-          <label className="mt-4 flex cursor-pointer items-start gap-3 border border-[var(--border)] bg-[var(--bg)] p-3">
-            <input
-              type="checkbox"
-              checked={useLlmRewrite}
-              onChange={(e) => setUseLlmRewrite(e.target.checked)}
-            />
-            <div className="flex-1 text-[11px]">
-              <div className="phosphor-soft uppercase tracking-wider">
-                LLM_REWRITE_PASS [recommended]
+          {/* ── LLM rewrite toggle + mode radio ── */}
+          <div className="mt-4 border border-[var(--border)] bg-[var(--bg)] p-3">
+            <label className="flex cursor-pointer items-start gap-3">
+              <input
+                type="checkbox"
+                checked={useLlmRewrite}
+                onChange={(e) => setUseLlmRewrite(e.target.checked)}
+              />
+              <div className="flex-1 text-[11px]">
+                <div className="phosphor-soft uppercase tracking-wider">
+                  LLM_REWRITE_PASS [recommended]
+                </div>
+                <div className="mt-1 text-[var(--fg-dim)]">
+                  {">"} claude rewrites text for audio before tts ::
+                  expands acronyms, replaces tables/algorithms/code with brief
+                  descriptions, converts math to spoken words, drops affiliations
+                  and references
+                </div>
               </div>
-              <div className="mt-1 text-[var(--fg-dim)]">
-                {">"} claude rewrites text for natural narration :: expands
-                acronyms, converts math to words, breaks dense sentences, drops
-                figure refs. disable for faster / cheaper runs.
+            </label>
+
+            {useLlmRewrite && (
+              <div className="mt-3 border-t border-[var(--border)] pt-3">
+                <div className="mb-2 text-[10px] uppercase tracking-wider text-[var(--fg-dim)]">
+                  {">>"} rewrite_mode
+                </div>
+                <div className="space-y-2">
+                  <label className="flex cursor-pointer items-start gap-3">
+                    <input
+                      type="radio"
+                      name="llmMode"
+                      value="narration"
+                      checked={llmMode === "narration"}
+                      onChange={() => setLlmMode("narration")}
+                      className="mt-0.5 h-3.5 w-3.5 cursor-pointer accent-[var(--phosphor)]"
+                    />
+                    <div className="flex-1 text-[11px]">
+                      <span className={llmMode === "narration" ? "phosphor" : "text-[var(--fg-dim)]"}>
+                        [ NARRATION ]
+                      </span>{" "}
+                      <span className="text-[var(--fg-dim)]">
+                        ~65% of input length :: preserves full paper content,
+                        every sentence rewritten for natural speech
+                      </span>
+                    </div>
+                  </label>
+                  <label className="flex cursor-pointer items-start gap-3">
+                    <input
+                      type="radio"
+                      name="llmMode"
+                      value="condensed"
+                      checked={llmMode === "condensed"}
+                      onChange={() => setLlmMode("condensed")}
+                      className="mt-0.5 h-3.5 w-3.5 cursor-pointer accent-[var(--phosphor)]"
+                    />
+                    <div className="flex-1 text-[11px]">
+                      <span className={llmMode === "condensed" ? "phosphor" : "text-[var(--fg-dim)]"}>
+                        [ CONDENSED ]
+                      </span>{" "}
+                      <span className="text-[var(--fg-dim)]">
+                        ~30% of input length :: dedup across sections, drop
+                        related work, compress methods, preserve findings +
+                        limitations :: 3x cheaper per paper
+                      </span>
+                    </div>
+                  </label>
+                </div>
               </div>
+            )}
+          </div>
+
+          {/* ── Cost estimator ── */}
+          <div className="mt-4 border border-[var(--border)] bg-[var(--bg)] p-3 text-[11px]">
+            <div className="mb-1 text-[10px] uppercase tracking-wider text-[var(--fg-dim)]">
+              {">>"} cost_estimate
             </div>
-          </label>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+              <span className="text-[var(--fg-dim)]">
+                raw buffer ::{" "}
+                <span className="phosphor-soft">
+                  {bufferChars.toLocaleString()} chars
+                </span>
+              </span>
+              <span className="text-[var(--fg-dim)]">
+                → tts input ::{" "}
+                <span className="phosphor-soft">
+                  {estimatedFinalChars.toLocaleString()} chars
+                </span>
+              </span>
+              {provider === "openai" && openaiModel && (
+                <span className="text-[var(--fg-dim)]">
+                  → cost ::{" "}
+                  <span className="phosphor">
+                    ${estimatedUsd.toFixed(4)}
+                  </span>{" "}
+                  <span className="text-[var(--fg-mute)]">
+                    ({openaiModel.costPer1M}/1M chars)
+                  </span>
+                </span>
+              )}
+              {provider === "elevenlabs" && (
+                <span className="text-[var(--fg-dim)]">
+                  → cost ::{" "}
+                  <span className={willExceedQuota ? "alert" : "phosphor"}>
+                    {estimatedCredits.toLocaleString()} credits
+                  </span>
+                  {quotaRemaining !== null && (
+                    <span className="text-[var(--fg-mute)]">
+                      {" "}
+                      (of {quotaRemaining.toLocaleString()} remaining)
+                    </span>
+                  )}
+                </span>
+              )}
+            </div>
+          </div>
         </Panel>
       </div>
 
@@ -693,11 +1242,78 @@ export default function Home() {
           >
             {error && (
               <div className="space-y-2 text-[11px] leading-relaxed">
-                <div className="alert">[FATAL] :: {error}</div>
-                <div className="text-[var(--fg-dim)]">
-                  {">"} check console or retry. if this persists, the upstream
-                  service may be down or the input buffer may be malformed.
-                </div>
+                {/* Quota-exceeded error — custom structured display */}
+                {error.includes("quota_exceeded") ? (
+                  <>
+                    <div className="alert uppercase tracking-wider">
+                      [FATAL] :: QUOTA_EXCEEDED
+                    </div>
+                    {(() => {
+                      const required = error.match(/(\d+) credits are required/i)?.[1];
+                      const remaining = error.match(/have (\d+) credits remaining/i)?.[1];
+                      const total = error.match(/quota of (\d+)/i)?.[1];
+                      return (
+                        <div className="space-y-1 text-[var(--fg-dim)]">
+                          <div>
+                            {">"} monthly quota ::{" "}
+                            <span className="phosphor-soft">{total ? parseInt(total).toLocaleString() : "?"}</span>{" "}
+                            credits
+                          </div>
+                          <div>
+                            {">"} remaining ::{" "}
+                            <span className="amber-glow">
+                              {remaining ? parseInt(remaining).toLocaleString() : "?"}
+                            </span>{" "}
+                            credits
+                          </div>
+                          <div>
+                            {">"} this request needs ::{" "}
+                            <span className="alert">
+                              {required ? parseInt(required).toLocaleString() : "?"}
+                            </span>{" "}
+                            credits
+                          </div>
+                        </div>
+                      );
+                    })()}
+                    <div className="mt-3 space-y-1 border-t border-[var(--border)] pt-3">
+                      <div className="phosphor-soft uppercase tracking-[0.2em] text-[10px]">
+                        &gt;&gt; options:
+                      </div>
+                      <div className="text-[var(--fg-dim)]">
+                        <span className="phosphor">[1]</span> switch model to{" "}
+                        <span className="phosphor-soft">eleven_flash_v2_5</span> (0.5x credit cost) — already your default now
+                      </div>
+                      <div className="text-[var(--fg-dim)]">
+                        <span className="phosphor">[2]</span> reduce input size — try just the abstract or first few paragraphs
+                      </div>
+                      <div className="text-[var(--fg-dim)]">
+                        <span className="phosphor">[3]</span> upgrade ::{" "}
+                        <a
+                          href="https://elevenlabs.io/app/subscription"
+                          target="_blank"
+                          rel="noreferrer"
+                          className="phosphor-soft underline hover:phosphor"
+                        >
+                          elevenlabs.io/app/subscription
+                        </a>
+                        {" "}— starter ($5/mo) gives 30k/month
+                      </div>
+                      <div className="text-[var(--fg-dim)]">
+                        <span className="phosphor">[4]</span> wait for monthly
+                        reset (your quota refreshes on your billing date)
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="alert">[FATAL] :: {error}</div>
+                    <div className="text-[var(--fg-dim)]">
+                      {">"} check console or retry. if this persists, the upstream
+                      service may be down or the input buffer may be malformed.
+                    </div>
+                  </>
+                )}
               </div>
             )}
 
