@@ -1,26 +1,317 @@
 @import "tailwindcss";
 
+/* ═══════════════════════════════════════════════════════════════════
+   PAPER_READER  ::  cypherpunk ascii-core
+   ═══════════════════════════════════════════════════════════════════ */
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* base surfaces */
+  --bg:          #070a07;
+  --bg-elev:     #0c110c;
+  --bg-panel:    #0a0f0a;
+
+  /* borders */
+  --border:         #15231a;
+  --border-bright:  #1f3324;
+  --border-hot:     #2d5438;
+
+  /* foreground */
+  --fg:       #d8ffd8;
+  --fg-dim:   #7fa97f;
+  --fg-mute:  #4a6a4a;
+  --fg-ghost: #2a4a30;
+
+  /* accents */
+  --phosphor: #00ff41;   /* primary matrix green */
+  --phosphor-dim: #00b530;
+  --alert:    #ff003c;   /* errors, destructive */
+  --info:     #00e5ff;   /* status chips */
+  --amber:    #ffb000;   /* warnings */
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
+  --color-background: var(--bg);
+  --color-foreground: var(--fg);
+  --color-phosphor: var(--phosphor);
+  --color-alert: var(--alert);
+  --color-info: var(--info);
+  --color-amber: var(--amber);
+  --font-sans: var(--font-geist-mono);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+/* Force dark mode — cypherpunk has no light theme */
+html {
+  color-scheme: dark;
+  background: var(--bg);
+}
+
+*, *::before, *::after {
+  font-family: var(--font-geist-mono), "IBM Plex Mono", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  min-height: 100vh;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "calt" 0, "liga" 0;
+  letter-spacing: 0.01em;
+}
+
+/* ascii art must not inherit letter-spacing — it breaks column alignment */
+pre {
+  letter-spacing: 0 !important;
+  line-height: 1 !important;
+  font-variant-numeric: tabular-nums;
+  font-variant-ligatures: none;
+}
+
+/* ───── scanlines overlay (pure CSS, no layout impact) ───── */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0px,
+    transparent 2px,
+    rgba(0, 255, 65, 0.025) 2px,
+    rgba(0, 255, 65, 0.025) 3px
+  );
+}
+
+/* ───── crt vignette ───── */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9998;
+  background: radial-gradient(
+    ellipse at center,
+    transparent 40%,
+    rgba(0, 0, 0, 0.55) 100%
+  );
+}
+
+/* ───── text selection — inverted phosphor ───── */
+::selection {
+  background: var(--phosphor);
+  color: var(--bg);
+  text-shadow: none;
+}
+
+/* ───── phosphor glow utility classes ───── */
+.phosphor {
+  color: var(--phosphor);
+  text-shadow:
+    0 0 1px var(--phosphor),
+    0 0 6px rgba(0, 255, 65, 0.45),
+    0 0 12px rgba(0, 255, 65, 0.25);
+}
+.phosphor-dim {
+  color: var(--phosphor-dim);
+}
+.phosphor-soft {
+  color: var(--phosphor);
+  text-shadow: 0 0 4px rgba(0, 255, 65, 0.5);
+}
+.alert {
+  color: var(--alert);
+  text-shadow: 0 0 6px rgba(255, 0, 60, 0.5);
+}
+.info-glow {
+  color: var(--info);
+  text-shadow: 0 0 5px rgba(0, 229, 255, 0.5);
+}
+.amber-glow {
+  color: var(--amber);
+  text-shadow: 0 0 5px rgba(255, 176, 0, 0.5);
+}
+
+/* ───── blinking cursor ───── */
+@keyframes blink {
+  0%, 49%   { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+.blink {
+  animation: blink 1s step-start infinite;
+}
+
+/* ───── scrolling scanner bar ───── */
+@keyframes scan {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}
+.scan-bar {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.scan-bar::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 33%;
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(0, 255, 65, 0.12) 50%,
+    transparent 100%
+  );
+  animation: scan 2.4s linear infinite;
+}
+
+/* ───── flickering status dot ───── */
+@keyframes flicker {
+  0%, 100%    { opacity: 1; }
+  40%, 42%    { opacity: 0.4; }
+  43%         { opacity: 1; }
+  70%         { opacity: 0.8; }
+}
+.flicker {
+  animation: flicker 4.2s infinite;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   form control overrides — make native inputs look like the terminal
+   ═══════════════════════════════════════════════════════════════════ */
+
+input, textarea, select, button {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+textarea {
+  background: transparent;
+  color: var(--fg);
+  caret-color: var(--phosphor);
+  outline: none;
+  resize: vertical;
+}
+textarea::placeholder {
+  color: var(--fg-ghost);
+}
+textarea:focus {
+  outline: none;
+}
+
+/* ───── custom select ───── */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background: var(--bg-elev);
+  color: var(--fg);
+  border: 1px solid var(--border-bright);
+  padding: 0.75rem 2.5rem 0.75rem 1rem;
+  cursor: pointer;
+  outline: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M0 0 L5 6 L10 0 Z' fill='%2300ff41'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 0.85rem center;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+select:hover {
+  border-color: var(--border-hot);
+}
+select:focus {
+  border-color: var(--phosphor);
+  box-shadow: 0 0 0 1px var(--phosphor), 0 0 12px rgba(0, 255, 65, 0.3);
+}
+select:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+select option {
+  background: var(--bg-elev);
+  color: var(--fg);
+}
+
+/* ───── custom checkbox — renders as [ ] / [X] ───── */
+input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 1.25rem;
+  height: 1.25rem;
+  border: 1px solid var(--border-bright);
+  background: var(--bg-elev);
+  cursor: pointer;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+input[type="checkbox"]:hover {
+  border-color: var(--border-hot);
+}
+input[type="checkbox"]:focus-visible {
+  outline: none;
+  border-color: var(--phosphor);
+  box-shadow: 0 0 0 1px var(--phosphor), 0 0 8px rgba(0, 255, 65, 0.4);
+}
+input[type="checkbox"]:checked {
+  border-color: var(--phosphor);
+}
+input[type="checkbox"]:checked::after {
+  content: "X";
+  color: var(--phosphor);
+  font-size: 0.9rem;
+  font-weight: 700;
+  line-height: 1;
+  text-shadow: 0 0 5px var(--phosphor);
+}
+
+/* ───── file input (label-wrapped, input hidden) ───── */
+input[type="file"] {
+  display: none;
+}
+
+/* ───── default button reset ───── */
+button {
+  cursor: pointer;
+  background: transparent;
+  color: inherit;
+  border: none;
+  outline: none;
+  padding: 0;
+  font: inherit;
+}
+button:disabled {
+  cursor: not-allowed;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   audio player — native control filtered to phosphor green
+   ═══════════════════════════════════════════════════════════════════ */
+audio {
+  width: 100%;
+  height: 44px;
+  filter: invert(1) hue-rotate(80deg) contrast(1.1) saturate(1.4);
+  border-radius: 0;
+}
+
+/* ───── scrollbar ───── */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-bright);
+  border: 1px solid var(--bg);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--phosphor-dim);
 }
